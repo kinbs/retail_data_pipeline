@@ -1,6 +1,7 @@
 # Environment variables and secrets
 .env
 .env.*
+!.env.example
 *.env
 
 # Caches and temporary files
@@ -17,8 +18,22 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 
 # IDE and editor files
 .vscode/
 .idea/
+
+# Local run artefacts
+.jdk/
+lake/
+warehouse/
+logs/
+spark-warehouse/
+data/raw/
+data/processed/
+
+# Airflow / Spark
+airflow-webserver.pid
+standalone_admin_password.txt

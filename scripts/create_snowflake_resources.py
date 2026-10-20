@@ -1,40 +1,45 @@
 from log_config import setup_logger
-import snowflake.connector as sc
-from scripts.config import SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ACCOUNT, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA
+from scripts import config, warehouse
 
+logger = setup_logger(__name__, str(config.LOGS_DIR / 'create_snowflake_resources.log'))
 
-logger = setup_logger(__name__, 'logs/create_snowflake_resources.log')
 
 def create_snowflake_resources():
-    logger.info("Starting creation of Snowflake resources...")
+    """Create warehouse, database, schema and the star-schema tables.
+
+    Locally this runs against DuckDB; in the cloud against Snowflake. Only the
+    database/schema/warehouse DDL differs, the table DDL is shared.
+    """
+    logger.info('Starting creation of warehouse resources...')
     try:
-        conn = sc.connect(
-            user=SNOWFLAKE_USER,
-            password=SNOWFLAKE_PASSWORD,
-            account=SNOWFLAKE_ACCOUNT
-        )
-        cursor = conn.cursor()
+        if config.USE_LOCAL:
+            conn = warehouse.connect()
+            cursor = conn
+        else:
+            import snowflake.connector as sc
 
-        # Create warehouse
-        logger.info(f"Creating warehouse: {SNOWFLAKE_WAREHOUSE}")
-        cursor.execute(f"CREATE WAREHOUSE IF NOT EXISTS {SNOWFLAKE_WAREHOUSE} WITH WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 300 AUTO_RESUME = TRUE")
+            conn = sc.connect(
+                user=config.SNOWFLAKE_USER,
+                password=config.SNOWFLAKE_PASSWORD,
+                account=config.SNOWFLAKE_ACCOUNT,
+            )
+            cursor = conn.cursor()
 
-        # Create database
-        logger.info(f"Creating database: {SNOWFLAKE_DATABASE}")
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {SNOWFLAKE_DATABASE}")
+            logger.info(f'Creating warehouse: {config.SNOWFLAKE_WAREHOUSE}')
+            cursor.execute(
+                f"CREATE WAREHOUSE IF NOT EXISTS {config.SNOWFLAKE_WAREHOUSE} "
+                "WITH WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 300 AUTO_RESUME = TRUE"
+            )
 
-        # Use the database
-        cursor.execute(f"USE DATABASE {SNOWFLAKE_DATABASE}")
+            logger.info(f'Creating database: {config.SNOWFLAKE_DATABASE}')
+            cursor.execute(f'CREATE DATABASE IF NOT EXISTS {config.SNOWFLAKE_DATABASE}')
+            cursor.execute(f'USE DATABASE {config.SNOWFLAKE_DATABASE}')
 
-        # Create schema
-        logger.info(f"Creating schema: {SNOWFLAKE_SCHEMA}")
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {SNOWFLAKE_SCHEMA}")
+            logger.info(f'Creating schema: {config.SNOWFLAKE_SCHEMA}')
+            cursor.execute(f'CREATE SCHEMA IF NOT EXISTS {config.SNOWFLAKE_SCHEMA}')
+            cursor.execute(f'USE SCHEMA {config.SNOWFLAKE_SCHEMA}')
 
-        # Use the schema
-        cursor.execute(f"USE SCHEMA {SNOWFLAKE_SCHEMA}")
-
-        # Create date dimension table
-        logger.info("Creating date_dim table")
+        logger.info('Creating date_dim table')
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS date_dim (
             date_key DATE PRIMARY KEY,
@@ -44,40 +49,43 @@ def create_snowflake_resources():
         )
         """)
 
-        # Create product dimension table
-        logger.info("Creating product_dim table")
+        logger.info('Creating product_dim table')
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS product_dim (
-            product_key STRING PRIMARY KEY,
-            product_name STRING
+            product_key VARCHAR PRIMARY KEY,
+            product_name VARCHAR
         )
         """)
 
-        # Create sales fact table
-        logger.info("Creating sales_fact table")
+        logger.info('Creating sales_fact table')
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS sales_fact (
             date_key DATE,
-            product_key STRING,
+            product_key VARCHAR,
             total_units_sold INT,
-            total_revenue FLOAT,
+            total_revenue DOUBLE,
             PRIMARY KEY (date_key, product_key),
             FOREIGN KEY (date_key) REFERENCES date_dim(date_key),
             FOREIGN KEY (product_key) REFERENCES product_dim(product_key)
         )
         """)
 
-        # Create processed_files table
-        logger.info("Creating processed_files table")
+        logger.info('Creating processed_files table')
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
-            filename STRING PRIMARY KEY,
-            processed_at TIMESTAMP_NTZ
+            filename VARCHAR PRIMARY KEY,
+            processed_at TIMESTAMP
         )
         """)
 
-        conn.close()
-        logger.info("Snowflake resources created successfully.")
+        if config.USE_LOCAL:
+            conn.commit()
+            conn.close()
+        else:
+            conn.close()
+
+        logger.info('Warehouse resources created successfully.')
+
     except Exception as e:
-        logger.exception(f"Error creating Snowflake resources: {str(e)}")
+        logger.exception(f'Error creating warehouse resources: {str(e)}')
         raise

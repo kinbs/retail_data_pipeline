@@ -1,84 +1,104 @@
-from log_config import setup_logger
-import boto3
+"""Load: write the cleaned, transformed rows into the data lake.
+
+Despite the historical name, this step is storage-agnostic: with ``USE_LOCAL=true``
+the lake is the local ``lake/processed_data/`` folder, otherwise it is the S3
+bucket configured in ``scripts/config.py``.
+
+De-duplication is content based: the MD5 of the CSV payload is stored as object
+metadata, and a payload that already exists is not uploaded twice.
+"""
 import hashlib
-from io import StringIO
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, when, isnan
-from pyspark.sql.types import IntegerType, FloatType, DateType
 from datetime import datetime
-from scripts.config import AWS_S3_BUCKET_NAME, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION
+from io import StringIO
 
-logger = setup_logger(__name__, 'logs/load_to_s3.log')
+import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col
+from pyspark.sql.types import DoubleType, IntegerType
 
-def calculate_hash(csv_content):
+from log_config import setup_logger
+from scripts import config, storage
+from scripts.transform_data import OUTPUT_COLUMNS
+
+logger = setup_logger(__name__, str(config.LOGS_DIR / 'load_to_s3.log'))
+
+
+def calculate_hash(csv_content: str) -> str:
     return hashlib.md5(csv_content.encode('utf-8')).hexdigest()
 
+
 def clean_and_validate_data(df: DataFrame) -> DataFrame:
-    # Convert 'Date' to date type and drop rows with invalid dates
-    df = df.withColumn("Date", when(col("Date").cast(DateType()).isNotNull(), col("Date")).cast(DateType()))
+    """Cast to warehouse-friendly types and drop unusable rows.
 
-    # Handle potential floating-point values and convert to integer types
-    df = df.withColumn("Year", when((col("Year").cast(FloatType()).isNotNull()), col("Year").cast(FloatType())).cast(IntegerType()))
-    df = df.withColumn("Month", when((col("Month").cast(FloatType()).isNotNull()), col("Month").cast(FloatType())).cast(IntegerType()))
-    df = df.withColumn("Day", when((col("Day").cast(FloatType()).isNotNull()), col("Day").cast(FloatType())).cast(IntegerType()))
-    df = df.withColumn("Total_Units_Sold", when((col("Total_Units_Sold").cast(FloatType()).isNotNull()), col("Total_Units_Sold").cast(FloatType())).cast(IntegerType()))
-    df = df.withColumn("Total_Revenue", when((col("Total_Revenue").cast(FloatType()).isNotNull()), col("Total_Revenue").cast(FloatType())))
+    Input columns come from ``transform_data``: date, year, month, day,
+    product_key, total_units_sold, total_revenue.
+    """
+    logger.info('Cleaning and validating transformed data...')
 
-    # Drop rows with any null values
+    df = df.select(*OUTPUT_COLUMNS)
+
+    df = (
+        df.withColumn('year', col('year').cast(IntegerType()))
+          .withColumn('month', col('month').cast(IntegerType()))
+          .withColumn('day', col('day').cast(IntegerType()))
+          .withColumn('total_units_sold', col('total_units_sold').cast(IntegerType()))
+          .withColumn('total_revenue', col('total_revenue').cast(DoubleType()))
+    )
+
+    before = df.count()
+    # A row without a date or a product key cannot be joined to the dimensions,
+    # and a row without a measure is useless - drop anything incomplete.
     df = df.dropna()
+    after = df.count()
+    if after != before:
+        logger.warning(f'Dropped {before - after} incomplete rows')
 
     return df
 
+
+def _to_csv_bytes(df: DataFrame) -> tuple[bytes, int]:
+    """Render the DataFrame as CSV bytes, with a stable date format."""
+    pdf = df.toPandas()
+    pdf['date'] = pd.to_datetime(pdf['date']).dt.strftime('%Y-%m-%d')
+    pdf = pdf[OUTPUT_COLUMNS].sort_values(['date', 'product_key']).reset_index(drop=True)
+
+    buffer = StringIO()
+    pdf.to_csv(buffer, index=False)
+    return buffer.getvalue().encode('utf-8'), len(pdf)
+
+
 def load_to_s3(df: DataFrame):
-    logger.info("Starting data load to S3...")
+    """Upload the processed CSV to the lake. Returns the object key (or None)."""
+    logger.info('Starting data load to the data lake...')
     try:
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-            region_name=AWS_REGION
-        )
-
-        # Clean and validate data
         cleaned_df = clean_and_validate_data(df)
+        payload, record_count = _to_csv_bytes(cleaned_df)
 
-        # Convert cleaned DataFrame to CSV
-        csv_buffer = StringIO()
-        cleaned_df.toPandas().to_csv(csv_buffer, index=False)
-        cleaned_csv_content = csv_buffer.getvalue()
+        current_hash = calculate_hash(payload.decode('utf-8'))
+        logger.info(f'Calculated hash for the cleaned CSV content: {current_hash}')
 
-        # Calculate hash for the cleaned CSV content
-        current_hash = calculate_hash(cleaned_csv_content)
-        logger.info(f"Calculated hash for the cleaned CSV content: {current_hash}")
+        existing = storage.find_by_hash(config.PROCESSED_PREFIX, current_hash)
+        if existing:
+            logger.info(f'CSV with hash {current_hash} already exists ({existing}). Skipping upload.')
+            return None
 
-        # Check if the hash already exists in the metadata of S3 objects
-        response = s3_client.list_objects_v2(Bucket=AWS_S3_BUCKET_NAME, Prefix='processed_data/')
-        if 'Contents' in response:
-            for obj in response['Contents']:
-                obj_metadata = s3_client.head_object(Bucket=AWS_S3_BUCKET_NAME, Key=obj['Key'])
-                if 'Metadata' in obj_metadata and obj_metadata['Metadata'].get('hash') == current_hash:
-                    logger.info(f"CSV file with hash {current_hash} already exists. Skipping upload.")
-                    return None
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        key = f'{config.PROCESSED_PREFIX}output_{timestamp}.csv'
 
-        # Generate a timestamped filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f'processed_data/output_{timestamp}.csv'
-
-        # Upload to S3 with metadata including the hash
-        s3_client.put_object(
-            Bucket=AWS_S3_BUCKET_NAME,
-            Key=filename,
-            Body=cleaned_csv_content,
-            Metadata={
-                'ProcessedDate': datetime.now().isoformat(),
-                'RecordCount': str(cleaned_df.count()),
-                'PipelineVersion': '1.0',
-                'hash': current_hash
-            }
+        storage.get_lake().put_bytes(
+            payload,
+            key,
+            {
+                'processeddate': datetime.now().isoformat(timespec='seconds'),
+                'recordcount': record_count,
+                'pipelineversion': '1.0',
+                'hash': current_hash,
+            },
         )
-        
-        logger.info(f"File {filename} uploaded successfully to S3.")
-        return filename
+
+        logger.info(f'Object {key} uploaded successfully ({record_count} rows).')
+        return key
+
     except Exception as e:
-        logger.exception(f"Error during S3 upload: {str(e)}")
+        logger.exception(f'Error while uploading to the data lake: {str(e)}')
         raise

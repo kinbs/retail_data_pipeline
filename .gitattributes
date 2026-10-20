@@ -1,0 +1,12 @@
+# Normalise line endings across platforms
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh  text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+
+# Binary artefacts
+*.png binary
+*.duckdb binary

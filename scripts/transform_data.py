@@ -1,61 +1,68 @@
-from log_config import setup_logger
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, year, month, dayofmonth, to_date
+"""Transform: one wide row per day -> one row per (day, product).
 
-logger = setup_logger(__name__, 'logs/transform_data.log')
+Source columns: ``Date, Q-P1..Q-P4, S-P1..S-P4`` (units sold and revenue for
+four products). Output columns, in the exact order the warehouse expects:
+
+    date, year, month, day, product_key, total_units_sold, total_revenue
+"""
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, dayofmonth, month, try_to_date, year
+
+from log_config import setup_logger
+from scripts import config
+
+logger = setup_logger(__name__, str(config.LOGS_DIR / 'transform_data.log'))
+
+PRODUCTS = ('P1', 'P2', 'P3', 'P4')
+OUTPUT_COLUMNS = ['date', 'year', 'month', 'day', 'product_key', 'total_units_sold', 'total_revenue']
+
 
 def transform_data(df: DataFrame) -> DataFrame:
-    logger.info("Starting data transformation...")
+    logger.info('Starting data transformation...')
     try:
-        # Log initial DataFrame info
-        logger.info(f"Initial DataFrame: {df.count()} rows, {len(df.columns)} columns")
+        logger.info(f'Initial DataFrame: {df.count()} rows, {len(df.columns)} columns')
 
-        # Convert Date column to date type
-        logger.info("Converting Date column to date type...")
-        df = df.withColumn("Date", to_date(col("Date"), "dd-MM-yyyy"))
-        logger.info("Date column converted successfully")
+        # 'dd-MM-yyyy' -> DateType (e.g. 13-06-2010).
+        # A handful of rows use a single-digit month ('31-9-2010'); 'd-M-yyyy'
+        # accepts both widths, and try_to_date() returns NULL instead of raising
+        # when the calendar date itself does not exist (September has 30 days).
+        df = df.withColumn('Date', try_to_date(col('Date'), 'd-M-yyyy'))
 
-        # Extract date parts
-        logger.info("Extracting year, month, and day from Date...")
-        df = df.withColumn("year", year(col("Date"))) \
-               .withColumn("month", month(col("Date"))) \
-               .withColumn("day", dayofmonth(col("Date")))
-        logger.info("Date parts extracted successfully")
+        invalid = df.filter(col('Date').isNull()).count()
+        if invalid:
+            logger.warning(
+                f'Dropped {invalid} rows with an unparseable/impossible date '
+                f"(e.g. '31-9-2010') - a known defect of the source CSV"
+            )
+            df = df.filter(col('Date').isNotNull())
 
-        # Explode the sales data into multiple rows for each product
-        logger.info("Exploding sales data for each product...")
-        sales_data = df.selectExpr(
-            "Date as date",
-            "year",
-            "month",
-            "day",
-            "'P1' as product_id", "`Q-P1` as total_units_sold", "`S-P1` as total_revenue"
-        ).union(df.selectExpr(
-            "Date as date",
-            "year",
-            "month",
-            "day",
-            "'P2' as product_id", "`Q-P2` as total_units_sold", "`S-P2` as total_revenue"
-        )).union(df.selectExpr(
-            "Date as date",
-            "year",
-            "month",
-            "day",
-            "'P3' as product_id", "`Q-P3` as total_units_sold", "`S-P3` as total_revenue"
-        )).union(df.selectExpr(
-            "Date as date",
-            "year",
-            "month",
-            "day",
-            "'P4' as product_id", "`Q-P4` as total_units_sold", "`S-P4` as total_revenue"
-        ))
+        df = df.withColumn('year', year(col('Date'))) \
+               .withColumn('month', month(col('Date'))) \
+               .withColumn('day', dayofmonth(col('Date')))
 
-        # Log final DataFrame info
-        logger.info(f"Transformed DataFrame: {sales_data.count()} rows, {len(sales_data.columns)} columns")
-        logger.info("Data transformation completed successfully")
+        # Unpivot the four product columns into rows.
+        frames = [
+            df.selectExpr(
+                'Date as date', 'year', 'month', 'day',
+                f"'{product}' as product_key",
+                f'`Q-{product}` as total_units_sold',
+                f'`S-{product}` as total_revenue',
+            )
+            for product in PRODUCTS
+        ]
 
+        sales_data = frames[0]
+        for frame in frames[1:]:
+            sales_data = sales_data.unionByName(frame)
+
+        sales_data = sales_data.select(*OUTPUT_COLUMNS)
+
+        logger.info(
+            f'Transformed DataFrame: {sales_data.count()} rows, {len(sales_data.columns)} columns'
+        )
+        logger.info('Data transformation completed successfully')
         return sales_data
 
     except Exception as e:
-        logger.exception(f"Error during data transformation: {str(e)}")
+        logger.exception(f'Error during data transformation: {str(e)}')
         raise

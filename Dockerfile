@@ -4,25 +4,20 @@ FROM apache/airflow:2.9.2
 # Set environment variables to ensure that Python outputs everything to the console
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
+# Install system dependencies (JDK 17 comes from apt so the image builds on any
+# CPU architecture - the previous hard-coded aarch64 tarball broke x86_64 hosts).
 USER root
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
     libpq-dev \
-    wget \
+    openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install OpenJDK 22
-RUN wget https://download.java.net/java/GA/jdk22/830ec9fcccef480bb3e73fb7ecafe059/36/GPL/openjdk-22_linux-aarch64_bin.tar.gz && \
-    tar -xvf openjdk-22_linux-aarch64_bin.tar.gz && \
-    mv jdk-22 /usr/local/ && \
-    rm openjdk-22_linux-aarch64_bin.tar.gz
-
 # Set JAVA_HOME environment variable
-ENV JAVA_HOME="/usr/local/jdk-22"
+ENV JAVA_HOME="/usr/lib/jvm/java-17-openjdk-amd64"
 ENV PATH="$JAVA_HOME/bin:$PATH"
-ENV PYTHONPATH="/opt/airflow:/opt/airflow/scripts:/opt/airflow/config:${PYTHONPATH}"
+ENV PYTHONPATH="/opt/airflow:/opt/airflow/scripts:${PYTHONPATH}"
 
 # Verify Java installation
 RUN java -version

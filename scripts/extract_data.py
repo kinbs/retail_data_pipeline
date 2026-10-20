@@ -1,45 +1,40 @@
-from log_config import setup_logger
 from pyspark.sql import SparkSession
-import boto3
-from scripts.config import AWS_S3_BUCKET_NAME, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION
 
-logger = setup_logger(__name__, 'logs/extract_data.log')
+from log_config import setup_logger
+from scripts import config, storage
+from scripts.spark_utils import get_spark
 
-def download_s3_file(bucket_name, file_key, download_path):
-    s3_client = boto3.client(
-        's3',
-        aws_access_key_id=AWS_ACCESS_KEY,
-        aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=AWS_REGION
-    )
-    
+logger = setup_logger(__name__, str(config.LOGS_DIR / 'extract_data.log'))
+
+
+def download_s3_file(file_key, download_path):
+    """Pull the raw file out of the lake (S3 bucket or local folder)."""
     try:
-        s3_client.download_file(bucket_name, file_key, download_path)
-        logger.info(f"File downloaded from S3: s3://{bucket_name}/{file_key}")
-    except Exception as e:
-        logger.error(f"Error downloading file from S3: {str(e)}")
-        raise
+        return storage.get_lake().download(file_key, download_path)
+    except FileNotFoundError:
+        # Empty lake: seed it from the CSV that ships with the repository.
+        logger.warning(f'{file_key} missing from the lake - seeding it now')
+        storage.ensure_raw_data()
+        return storage.get_lake().download(file_key, download_path)
 
-def extract_data():
-    logger.info("Starting data extraction...")
+
+def extract_data(spark: SparkSession = None, file_key: str = None):
+    """Extract: lake -> local CSV -> Spark DataFrame."""
+    logger.info('Starting data extraction...')
+    spark = spark or get_spark('RetailDataETL')
+    file_key = file_key or config.RAW_FILE_KEY
+    download_path = config.DATA_DIR / 'raw' / 'statsfinal.csv'
+
     try:
-        # Define the S3 file key
-        file_key = 'data/statsfinal.csv'
-        download_path = 'data/statsfinal.csv'
-        
-        # Download the CSV file from S3
-        download_s3_file(AWS_S3_BUCKET_NAME, file_key, download_path)
-        
-        # Initialize Spark session
-        spark = SparkSession.builder \
-            .appName("RetailDataETL") \
-            .getOrCreate()
+        download_s3_file(file_key, download_path)
 
-        # Load CSV file into DataFrame
-        df = spark.read.csv(download_path, header=True, inferSchema=True)
-        
-        logger.info(f"Data extracted successfully from s3://{AWS_S3_BUCKET_NAME}/{file_key}. Row count: {df.count()}")
+        df = spark.read.csv(str(download_path), header=True, inferSchema=True)
+
+        logger.info(
+            f'Data extracted successfully from {file_key}. '
+            f'Row count: {df.count()}, columns: {df.columns}'
+        )
         return df
     except Exception as e:
-        logger.exception(f"Error during data extraction: {str(e)}")
+        logger.exception(f'Error during data extraction: {str(e)}')
         raise
